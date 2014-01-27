@@ -1,0 +1,650 @@
+<!--
+Analysis of anthrax infected cells vs. control cells
+-->
+```{r setup, echo=FALSE}
+opts_chunk$set(tidy=TRUE, highlight=TRUE, fig.align='left', fig.show='hold',
+               cache=FALSE, highlight=TRUE, autodep=TRUE, warning=FALSE, error=FALSE,
+               message=FALSE, prompt=TRUE, comment='', fig.cap='')
+```
+
+# Overview
+We are going to start with 30 samples total, 2 from each patient. One
+sample taken at the time of an asthma exacerbation, the other sample
+taken several months later when the patient has returned to
+baseline. Basic pairwise analysis to start, but obviously there are
+covariates that we want to look at - probably the most important being
+differences in CBC between samples.
+
+That's relatively straightforward. I'm trying not to provide quotes
+until I've seen the data quality, but ballpark would be 4-8k depending
+on how much postprocessing we have to do. I'd provide you with the
+final scripts which you can use (in R) to tweak the downstream
+analysis, model in additional covariates, etc.
+
+These are samples taken from a patient at a point where there is
+asthma exacerbation and later on when it has returned to baseline.
+There are patients both positive and negative for rhinovirus.
+I think they probably want to know what is different between
+the asthma exacerbation and the baseline state. They also probably want
+to know if there are differences between the rhinovirus and non-rhinovirus
+groups. That is a secondary aim probably.
+
+Priority: exacerbated and baseline differences, paired in the patient.
+Use edgeR. Need to figure out how to do the paired analysis.
+
+~ patient + status
+
+this will give us the average effect of the exacerbation on the patients.
+we can also add in the rhinovirus:
+
+~ patient + rhinovirus + status
+
+look at section 4.5 of the arabadopsis section
+
+
+```{r load-data, cache=TRUE}
+library(xtable)
+library(googleVis)
+library(CHBUtils)
+library(edgeR)
+library(HTSFilter)
+library(ggplot2)
+library(gridExtra)
+library(vsn)
+library(DESeq2)
+wd = "/Users/rory/cache/kantor_asthma/scripts"
+setwd(wd)
+metadata_file = "/Users/rory/hsph/hsph/projects/kantor_asthma_rnaseq/data/asthma_project.csv"
+metadata = read.csv(metadata_file, header=TRUE, colClasses="factor")
+metadata$samplename = gsub("-", "_", metadata$samplename, fixed=T)
+count_file = "/Users/rory/hsph/hsph/projects/kantor_asthma_rnaseq/asthma_project/final/131126_asthma_project/combined.counts"
+counts = read.table(count_file, header=TRUE, sep="\t")
+colnames(counts) = gsub(".", "_", colnames(counts), fixed=T)
+rownames(counts) = counts$id
+counts$id = NULL
+samples = data.frame(samplename=colnames(counts))
+samples = merge(samples, metadata, by="samplename", sort=FALSE)
+samples$patient_status = paste(samples$patient, samples$status, sep="_")
+colnames(counts) = samples$patient_status
+```
+
+First we need to load in the data and prepare some metadata about each of
+the samples. R destroys some of the sample names so we have to do a little bit
+of massaging to get everything working properly. We are left with a table of counts
+and some metadata about all of the samples.
+
+```{r data-setup, results='asis'}
+#print(gvisTable(head(counts)), "chart")
+#print(gvisTable(samples), "chart")
+print(xtable(samples), "html")
+print(xtable(head(counts)), "html")
+```
+
+We also will define a couple of utility functions we'll use to add some
+context to the data.
+```{r utility-functions}
+ensembl_gene = "hsapiens_gene_ensembl"
+filter_type = "ensembl_gene_id"
+gene_symbol = "hgnc_symbol"
+annotate_df = function(d) {
+	require(biomaRt)
+	ensembl = useMart('ensembl', dataset = ensembl_gene)
+	a = getBM(attributes=c(filter_type, gene_symbol, "description"),
+		filters=c(filter_type), values=rownames(d),
+		mart=ensembl)
+	m = merge(d, a, by.x="row.names", by.y=filter_type)
+	return(m)
+}
+```
+
+# Exploratory analysis
+The first thing to do is to look at the data qualitatively to spot any
+outliers and see if the data makes sense. We will use some of the
+plots in the libraries DESeq and edgeR along with some custom made
+plots to do this.
+
+Since the range of the data is so huge, (0 - `r max(counts)`) for this
+type of exploratory data analysis it is usually useful to work on
+transformed versions of the data, otherwise a relatively small change
+in a gene highly expessed will dwarf everything else.
+
+A first sanity check is to see which genes are soaking up so many
+reads.  Millions of reads for a single gene is a concerning amount
+of reads to be mapping
+to one gene.
+
+```{r high-count-genes, results='asis'}
+library(xtable)
+print(xtable(annotate_df(counts[rowSums(counts) > 10000000,])), "html")
+```
+
+Hemoglobin genes make sense for this project, it would be really
+disappointing if these were rRNA or some other type of contaminant we
+aren't interested in.
+
+The libraries are a little bit deeper than is optimal in terms of
+maximizing the benefit of more reads vs the cost of sequencing,
+averaging `r mean(colSums(counts))` reads mapping to genes per
+sample. However since a small number of genes are soaking up a lot of
+the reads, the libraries are close to the sweet spot of 15-20 million
+reads per sample in terms of what is usable. If experiments are run on
+blood in the future, it might be worth investigating ways of pulling out
+the hemoglobin transcripts prior to sequencing so not as much of the
+sequencing is wasted on them.
+
+## Two patients are missing a sample
+Patient A006 and patient A072 both had samples that failed. A006 is missing
+their baseline sample and A072 is missing their exacerbation sample. Missing
+the sample will make it so later on we can't do some comparisons because
+the design matrix of our experiment won't be full rank, so we should drop
+these samples unless there is an objection to doing that.
+
+```{r drop-incomplete-samples}
+samples = subset(samples, ! patient %in% c("A072", "A006"))
+samples = droplevels(samples)
+counts = counts[, colnames(counts) %in% samples$patient_status]
+```
+
+## Variance stabilization
+For RNA-seq data it is hard to call differentially expressed genes for
+genes with very low read counts because the variance of genes with
+very low counts is enormous:
+
+```{r edgeR-dispersions, cache=TRUE}
+design = model.matrix(~ patient + status, data=samples)
+y = DGEList(counts = counts)
+y = calcNormFactors(y)
+y = estimateGLMCommonDisp(y, design)
+y = estimateGLMTrendedDisp(y, design)
+y = estimateGLMTagwiseDisp(y, design)
+bcv(y)
+```
+
+So when we are looking at differentially expressed genes later on,
+focusing on genes with not an extremely low count is prudent.
+
+Also, for RNA-seq experiments in general there is a marked
+relationship between the mean expression level of a gene and the
+variance of the gene. When performing differential expression
+we'll work with the raw counts, but for qualitative visualiation, applying a variance stablizing transformation to the data, which removes the component of the variance that is dependent on the mean value, is useful.  For this data set a simple log transformation of the data smooths the variance out quite a bit:
+
+```{r variance-stabilization, cache=TRUE, fig.keep='all'}
+dds = DESeqDataSetFromMatrix(countData=counts, colData=samples,
+    design = ~ patient + status)
+dds <- estimateSizeFactors(dds)
+rld = rlogTransformation(dds, blind=TRUE)
+notAllZero = rowSums(counts(dds)) > 0
+par(mfrow = c(1, 2))
+meanSdPlot(log2(counts(dds, normalized=TRUE)[notAllZero,] + 1))
+meanSdPlot(assay(rld[notAllZero,]))
+```
+
+The effect of the variance stablizing transformation on visualization of
+the data can be seen by looking at clustering of the samples based on
+Euclidean distance. Without stabilizing the variance a few highly expressed
+variant genes skew the distance measure and make clustering fail. This
+heatmap would give anyone a heart attack:
+
+```{r heatmap-novst}
+dists = dist(t(counts))
+mat = as.matrix(dists)
+rownames(mat) = colnames(mat) = colnames(counts)
+library(gplots)
+heatmap.2(mat, trace="none")
+```
+
+But with the variance stabilized data, we can see clear clustering on the
+baseline and exacerbation status of the samples:
+    
+```{r heatmap-vst}
+dists = dist(t(assay(rld)))
+mat = as.matrix(dists)
+rownames(mat) = colnames(mat) = colnames(counts)
+library(gplots)
+heatmap.2(mat, trace="none")
+```
+
+We can also see the effect of the transformation on the MDS plots. With
+the raw data they look like this:
+```{r mds-plots}
+mds(counts, samples$status)
+```
+
+But using the variance transforming stabilization we can see the clear
+separation between the exacerbated and baseline samples along the
+first principal component, exactly what we were hoping to see. The
+plot on the left shows the proportion of the variance explained by
+each principal component:
+
+```{r mds-transformed}
+par(mfrow=c(1,2))
+mds(assay(rld), samples$status)
+variance_by_component(assay(rld))
+```
+
+# Differential expression
+From the exploratory analysis we are expecting to see quite a few genes
+that are different between the baseline and exacerbated experimental
+conditions.
+
+First things first, we want to remove those low count high variance genes
+from consideration. Removing these genes chops off the hugely variant
+genes at the low end of expression and lets us work with a set of genes
+we can be more confident about.
+
+```{r discard-low-count-high-variance}
+keep = rowSums(log2(cpm(counts)) > -2.5) >= 4
+counts = counts[keep,]
+table(keep)
+design = model.matrix(~ patient + status, data=samples)
+y = DGEList(counts = counts)
+y = calcNormFactors(y)
+y = estimateGLMCommonDisp(y, design)
+y = estimateGLMTrendedDisp(y, design)
+y = estimateGLMTagwiseDisp(y, design)
+bcv(y)
+```
+
+This dataset is paired, with a baseline and exacerbated status
+for each patient and we will adjust for the patient during the differential
+expression analysis. It is interesting to ask whether or not it is even
+necessary to do that. All of our analysis is going to use a model where
+we fit a GLM blocking on patient, so first do that:
+
+```{r edgeR-fit}
+design = model.matrix(~ patient + status, data=samples)
+rownames(design) = colnames(counts)
+y = DGEList(counts=counts)
+y = calcNormFactors(y)
+y = estimateGLMCommonDisp(y, design, verbose=TRUE)
+y = estimateGLMTrendedDisp(y, design)
+y = estimateGLMTagwiseDisp(y, design)
+bcv(y)
+fit = glmFit(y, design)
+```
+
+Now we can test for differential expression at the patient level:
+
+```{r patient-de, results='asis'}
+lrt = glmLRT(fit, coef=2:14)
+FDR = p.adjust(lrt$table$PValue, method="BH")
+print(xtable(topTags(lrt)$table), "html")
+```
+
+There are `r sum(FDR < 0.05)` genes differentially expressed between
+patients, so blocking on patient is a good plan.
+
+Going ahead and doing a differential expression test on the exacerbation
+status, blocking on patient:
+
+```{r status-de}
+lrt = glmLRT(fit, coef=15)
+FDR = p.adjust(lrt$table$PValue, method="BH")
+de = lrt$table
+de$FDR = FDR
+de = subset(de, FDR < 0.05)
+de = annotate_df(de)
+de = de[with(de, order(FDR)),]
+```
+
+gives us `r sum(FDR < 0.05)` genes differentially expressed. That is a lot of
+genes, cutting down that list will be helpful.
+
+I'm worried that some of the genes with huge counts associated with them
+are skewing the results for all of the genes.
+
+dds = DESeqDataSetFromMatrix(countData=counts, colData=samples,
+    design = ~ patient + status)
+dds <- estimateSizeFactors(dds)
+dds = DESeq(dds)
+res = results(dds, contrast=c("status", "exacerbation", "baseline"))
+
+## ```{r edgerR-rhinovirus-fit}
+## design = model.matrix(~ patient + rhinovirus + status, data=samples)
+## rownames(design) = colnames(counts)
+## y = DGEList(counts=counts)
+## y = estimateGLMCommonDisp(y, design, verbose=TRUE)
+## y = estimateGLMTrendedDisp(y, design)
+## y = estimateGLMTagwiseDisp(y, design)
+## fit = glmFit(y, design)
+## ```
+## lrt = glmLRT(fit, coef=18)
+## FDR = p.adjust(lrt$table$PValue, method="BH")
+
+## in_asthma = read.csv("/Users/rory/Downloads/asthma.txt",
+##    header=TRUE, sep="\t")$Ensembl.Gene.ID
+
+## ```{r htsfilter}
+## lrt = HTSFilter(lrt, DGEGLM=fit, s.len=25)$filteredData
+## bcv(lrt$filteredData)
+## ```
+
+## bcv(HTSFilter(y)$filteredData)
+
+## lrt = glmLRT(fit, coef=17)
+## tab = lrt$table
+## tab$FDR = p.adjust(tab$PValue)
+## library(HTSFilter)
+
+
+
+## filtered = HTSFilter(counts, conds=)
+## We pick the arbitrary cutoff for at least 4 samples
+## to have a log2(counts per million) > -2.5, that cuts off the huge peak
+## in variance in the low-count genes.
+
+## ```{r discard-low-count-high-variance}
+## keep = rowSums(log2(cpm(counts)) > -2.5) >= 4
+## counts = counts[keep,]
+## table(keep)
+## design = model.matrix(~ patient + status, data=samples)
+## y = DGEList(counts = counts)
+## y = estimateGLMCommonDisp(y, design)
+## y = estimateGLMTrendedDisp(y, design)
+## y = estimateGLMTagwiseDisp(y, design)
+## bcv(y)
+## ```
+
+
+## RNA-seq experiments show a marked relationship between the mean expression
+## level of a gene and the variance of the gene. We apply a variance stablizing
+## transformation to the data which removes the component of the variance that
+## is dependent on the mean value.
+
+
+
+## The MDS plot is a little bit all over the place, but since this is patient data
+## that kind of variability is not uncommon. There is a sample that is an outlier,
+## A036-2_exacerbation that we might have to drop, in which case we'll drop both
+## that sample and its baseline sample.
+## ```{r mds-plot}
+## mds(counts, samples$status)
+## variance_by_component(counts)
+## ```
+
+## The samples cluster very nicely by baseline/exacerbation status, looking
+## at the top 30 expressed genes:
+## ```{r heatmap}
+## library(DESeq)
+## cdsFull = newCountDataSet(counts, samples)
+## cdsFull = estimateSizeFactors(cdsFull)
+## cdsFullBlind = estimateDispersions( cdsFull, method = "blind" )
+## vsdFull = varianceStabilizingTransformation( cdsFullBlind )
+## library("RColorBrewer")
+## library("gplots")
+## select = order(rowMeans(counts(cdsFull)), decreasing=TRUE)[1:30]
+## hmcol = colorRampPalette(brewer.pal(9, "GnBu"))(100)
+## heatmap.2(exprs(vsdFull)[select,], col = hmcol, trace="none", margin=c(10, 6))
+## ```
+
+## ```
+## p1 = mds(counts, samples$day)
+## p2 = mds(counts, samples$extraction)
+## p3 = variance_by_component(counts)
+## grid.arrange(p1, p2, p3)
+## ```
+
+## # Design
+## We'll use a blocking structure which will take into account the different extraction
+## days and protocols.
+## ```{r design}
+## rownames(samples) = samples$samplename
+## design = model.matrix(~ 0 + day, data=samples)
+## #design = model.matrix(~0 + day + extraction, data=samples)
+## design
+## ```
+
+## # Dispersion estimation
+## It is useful to look at the variation in the data and make sure it is
+## within the bounds we expect and to put some realistic expectation on
+## what kind of calls we can make. You can see from the dispersion plot
+## that genes with low CPM (counts per million) have a high degree of
+## variation-- a small signal with a large variation means that we won't
+## be able to make reliable differential calls on most of these genes. A
+## common thing people do is to just remove those genes from
+## consideration entirely, but I don't like doing that since it is
+## possible there is a reliable signal or two lurking there.  As long as
+## we keep in mind that those low CPM genes are off in the weeds a bit,
+## it is fine.
+
+## ```{r dispersions}
+## y = DGEList(counts = counts)
+## y = estimateGLMCommonDisp(y, design)
+## y = estimateGLMTrendedDisp(y, design)
+## y = estimateGLMTagwiseDisp(y, design)
+## bcv(y)
+## ```
+
+## One thing we will do lAter is to try to cut down on the number of
+## genes we are considering for differntial expression. In a single cell,
+## somewhere around 1/3 to a half of all possible genes are expressed, so
+## that means that there are a low number of genes which all will be
+## considered for differential expression but aren't changing because
+## they aren't even expressed. We can remove these low count genes via a
+## couple of different methods.  The one most people do is to just set a
+## threshold of 2-3 log CPM and only consider those genes, which I don't
+## like because you throw out some signal.  An alternative method would
+## be to keep only genes that could possibly be DE, that is genes which
+## are not lowly expressed with a similar expression level across all
+## conditions. There is a package to do that which we'll use. You can see
+## the effect of what it does by looking at the BCV plot after they are
+## removed. A lot of the lowly expressed genes have been removed as well as
+## some of the lowly expressed extremely variable genes.
+
+## ```{r htsfilter-preview}
+## bcv(HTSFilter(y)$filteredData)
+## ```
+
+## # Differential expression
+## ```{r differential-expression}
+## fit = glmFit(y, design)
+## day9_vs_day11 = makeContrasts(day9_vs_day11=day11-day9, levels=design)
+## lrt = glmLRT(fit, contrast=day9_vs_day11)
+## topTags(lrt)
+## lrt_filt = HTSFilter(lrt, DGEGLM=fit, s.len=25, plot=FALSE)$filteredData
+## topTags(lrt_filt)
+## ```
+
+## Unfortunately we aren't picking up anything from this analysis. Since there
+## didn't seem to be any systematic differences between the experiment 1 and
+## experiment 2 samples, we could try looking at that simpler model.
+
+## ```{r differential-expression-two-factor}
+## design = model.matrix(~0 + day, data=samples)
+## design
+## y = DGEList(counts = counts)
+## y = estimateGLMCommonDisp(y, design)
+## y = estimateGLMTrendedDisp(y, design)
+## y = estimateGLMTagwiseDisp(y, design)
+## bcv(y)
+## fit = glmFit(y, design)
+## day9_vs_day11 = makeContrasts(day9_vs_day11=day11-day9, levels=design)
+## lrt = glmLRT(fit, contrast=day9_vs_day11)
+## topTags(lrt)
+## lrt_filt = HTSFilter(lrt, DGEGLM=fit, s.len=25, plot=FALSE)$filteredData
+## topTags(lrt_filt)
+## ```
+
+## Still nothing is popping out as significant. EdgeR and other count-based methods are not
+## the best at identifying DE genes that are expressed in only one condition, so maybe
+## voom + limma will be better.
+
+## ```{r voom}
+## library(limma)
+## #design = model.matrix(~0 + day + extraction, data=samples)
+## design = model.matrix(~day, data=samples)
+## nf = calcNormFactors(counts, method = "TMM")
+## y = calcNormFactors(y)
+## v = voom(y, design, plot=TRUE)
+## fit = lmFit(v, design)
+## fit = eBayes(fit)
+## voom.pvalues = fit$p.value[, 2]
+## voom.adjpvalues = p.adjust(voom.pvalues, method = "BH")
+
+
+## design = model.matrix(~day, data=samples)
+## voom.data = voom(counts, design = design, lib.size = colSums(counts) * nf)
+## voom.data$genes = rownames(counts)
+## voom.fitlimma = lmFit(voom.data, design = design)
+## voom.fitbayes = eBayes(voom.fitlimma)
+## voom.pvalues = voom.fitbayes$p.value[, 2]
+## voom.adjpvalues = p.adjust(voom.pvalues, method = "BH")
+## head(sort(voom.adjpvalues))
+## ```
+
+## It is still not looking good, those are the lowest adjusted p-values from
+## voom + limma.
+
+## # Why aren't we seeing anything?
+
+## The correlations between the samples are lower than we would
+## expect. You can see that sample D11_3 looks like an outlier, though
+## the scale on the heatmap is a little bit misleading, however the
+## correlations between most of the samples are not very good in general.
+## That is reflected in the coefficient of biological variation plot
+## above, the common dispersion line (the horizontal line) is higher than normal,
+## it should be closer to 0.4 or 0.5 for these types of samples. A heatmap
+## of the pairwise correlations of the normalized counts of each sample is below.
+
+## ```{r correlations}
+## library(gplots)
+## nc = cpm(y)
+## cor(nc)
+## heatmap.2(cor(nc), trace="none")
+## ```
+
+## If we cluster the samples by MARCO fold change, there are two of the
+## six samples from each day which don't cluster with the of the samples
+## from their day.
+
+## ```{r marco}
+## marco_expr = nc[MARCO_ID,]
+## marco_expr
+## heatmap.2(log(outer(marco_expr, marco_expr, "/")), trace="none")
+## ```
+
+## Does looking at ACTB fold change show a similar clustering effect?
+## ```{r actb}
+## actb_expr = nc["ENSMUSG00000029580",]
+## heatmap.2(log(outer(actb_expr, actb_expr, "/")), trace="none")
+## ```
+
+## No, and the correlations are much higher, this looks more randomly
+## distributed.
+
+## The MARCO clustering is similar to the result found when the data was
+## analyzed before using FPKM from Cufflinks. The samples that don't
+## cluster with MARCO fold change (D9_1, D9_6, D11_1, D11_2) have some
+## overlap with the set
+## of samples which don't cluster properly using all of the
+## genes (D9_6, D11_1, D11_2), but not quite completely overlaping. I don't really like
+## removing samples that don't cluster together and then calling
+## differential expression on them, because it is cheating unless you
+## have a good reason for it. You are basically saying, I think there are
+## systematic differences based on a factor between these samples, let's
+## first remove the samples that would make that hypothesis invalid, and
+## then test for differential expression. That isn't proper.
+
+## In this case having the MARCO marker gives us an independent reason for
+## dropping samples if we choose to go that route.
+
+## For now let's try using the MARCO expression in the RNA-seq data as a
+## factor to consider. We'll rescale the MARCO expression vector so it is
+## centered on zero and are in units of SD from zero and add that into the
+## experimental design:
+
+## ```{r marco_center}
+## marco_rescale = (marco_expr - mean(marco_expr)) / sd(marco_expr)
+## samples$standard_marco = marco_rescale
+## samples
+## ```
+
+## And run differential expressing using our rescaled MARCO values as a regressor.
+## The way to interpret the log fold change of this are these are the fold change in
+## a gene that occurs for each standard deviations MARCO deviates from the mean.
+
+## ```{r marco-analysis}
+## keep = rowSums(cpm(counts)) > 3
+## design = model.matrix(~day + marco_rescale, data=samples)
+## z = y[keep,]
+## z$samples$lib.size = colSums(z$counts)
+## z = estimateGLMCommonDisp(z, design)
+## z = estimateGLMTrendedDisp(z, design)
+## z = estimateGLMTagwiseDisp(z, design)
+## fit = glmFit(z, design)
+## lrt = glmLRT(fit, coef=3)
+## topTags(lrt)
+
+## ensembl_gene = "mmusculus_gene_ensembl"
+## filter_type = "ensembl_gene_id"
+## gene_symbol = "mgi_symbol"
+## annotate_df = function(d) {
+## 	require(biomaRt)
+## 	ensembl = useMart('ensembl', dataset = ensembl_gene)
+## 	a = getBM(attributes=c(filter_type, gene_symbol, "description"),
+## 		filters=c(filter_type), values=d[,"id"],
+## 		mart=ensembl)
+## 	m = merge(d, a, by.x='id', by.y=filter_type)
+## 	return(m)
+## }
+## tags = topTags(lrt, dim(lrt$fitted.values)[1])$table
+## tags$id = rownames(tags)
+## tags = annotate_df(tags)
+## tags = tags[order(tags$PValue),]
+## ```
+
+## ```{r table-output, results='asis'}
+## library(googleVis)
+## print(gvisTable(head(tags, 100), options=list(width=800, height=500)), "chart")
+## write.table(tags, file="FC_vs_unit_of_marco_change.tsv", quote=FALSE,
+##   sep="\t", row.names=FALSE)
+## ```
+
+## This spits out a promising list of genes, although none are significantly
+## different statistically. The table above is supposed to scroll around, but
+## something isn't working right with the way Google has been doing it. You might
+## have to click in the box and scroll around or possibly use the arrow keys to
+## scroll around, I haven't figured out what the bug is. I included the top 100 in
+## the table and saved the entire list of genes to the file 'FC_vs_unit_of_marco_change.tsv'.
+
+
+## # D9 vs D11 with dropping samples
+## For this, lets try dropping the four samples which don't cluster with
+## the others in their group looking at MARCO fold change derived from
+## the sequencing data (D9_5, D9_6, D11_1, D11_2). That way our group is
+## D9 vs D11, looking at only the low MARCO expressors in D9 and the high
+## MARCO expressors in D11. Since we already rigged it to be high and low
+## MARCO expressors, we'll just use day to run the model.
+
+## ```{r D9_vs_D11_low_vs_high_only, results='asis'}
+## keep_samples = !colnames(z) %in% c("D9_5", "D9_6", "D11_1", "D11_2")
+## design = model.matrix(~day, data=samples[keep_samples,])
+## z = z[,keep_samples]
+## z = estimateGLMCommonDisp(z, design)
+## z = estimateGLMTrendedDisp(z, design)
+## z = estimateGLMTagwiseDisp(z, design)
+## fit = glmFit(z, design)
+## lrt = glmLRT(fit)
+
+## ensembl_gene = "mmusculus_gene_ensembl"
+## filter_type = "ensembl_gene_id"
+## gene_symbol = "mgi_symbol"
+## annotate_df = function(d) {
+## 	require(biomaRt)
+## 	ensembl = useMart('ensembl', dataset = ensembl_gene)
+## 	a = getBM(attributes=c(filter_type, gene_symbol, "description"),
+## 		filters=c(filter_type), values=d[,"id"],
+## 		mart=ensembl)
+## 	m = merge(d, a, by.x='id', by.y=filter_type)
+## 	return(m)
+## }
+## tags = topTags(lrt, dim(lrt$fitted.values)[1])$table
+## tags$id = rownames(tags)
+## tags = annotate_df(tags)
+## tags = tags[order(tags$PValue),]
+## library(googleVis)
+## print(gvisTable(head(tags, 100), options=list(width=800, height=500)), "chart")
+## write.table(tags, file="FC_D9_vs_D11_outliers_dropped.tsv", quote=FALSE,
+##   sep="\t", row.names=FALSE)
+## ```
+## ```
