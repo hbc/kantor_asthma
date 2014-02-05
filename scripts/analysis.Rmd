@@ -12,9 +12,19 @@ This project is looking at fifteen sets of blood samples with two sets of
 blood samples from each patient. The first sample is at the time of an
 asthma exacerbation and the other is taken months later when the patient
 has returned to normal. The main factor of interest is what is different
-in the blood in the exacerbated vs. the baseline state. There are some
-other covariates they would like to look at too such as a positive
-test for rhinovirus, CBC (complete blood count), etc.
+in the blood in the exacerbated vs. the baseline state. This is likely to
+be complex because there are large changes in the cellular composition
+of the blood during the two states which must be controlled for. In addition
+there are some other covariates that might have to get controlled for such
+as rhinovirus infection.
+
+# Setup
+First thing to do is to load in the libraries we will use and massage the
+data a bit to be in a format that is easier to work with. Below we make
+sure all of the identifiers are congruent and convert the columns of
+data to be what they are expected to be. We also load in and reformat
+a table of metadata about each sample which we will use as regressors
+later on.
 
 ```{r load-data, cache=TRUE}
 library(dplyr)
@@ -54,14 +64,9 @@ for (col in numeric_columns) {
 }
 ```
 
-First we need to load in the data and prepare some metadata about each of
-the samples. R destroys some of the sample names so we have to do a little bit
-of massaging to get everything working properly. We are left with a table of counts
-and some metadata about all of the samples.
+We are left with a table of counts and some metadat about all of the samples:
 
 ```{r data-setup, results='asis'}
-#print(gvisTable(head(counts)), "chart")
-#print(gvisTable(samples), "chart")
 print(xtable(samples), "html")
 print(xtable(head(counts)), "html")
 ```
@@ -83,10 +88,21 @@ annotate_df = function(d) {
 }
 ```
 
+And some genes that we are expecting to see:
+
+```{r expected-genes}
+expected = c("CDHR3", "PDE4D", "DENND1B", "RAD50", "IL13",
+ "IL1RL1", "IL2RL1", "IL3RL1", "IL4RL1", "IL5RL1", "IL6RL1",
+ "IL7RL1", "IL8RL1", "IL9RL1", "IL10RL1", "IL11RL1", "IL12RL1",
+ "IL13RL1", "IL14RL1", "IL15RL1", "IL16RL1", "IL17RL1",
+ "IL18RL1", "IL33", "RORA", "SMAD3", "IL2RB", "TSLP-WDR36",
+ "PYHIN1", "ADRA1B", "DPP10", "PRNP")
+```
+
 # Exploratory analysis
-The first thing to do is to look at the data qualitatively to spot any
-outliers and see if the data makes sense. We will use some of the
-plots in the libraries DESeq and edgeR along with some custom made
+Looking at the data qualitatively is helpful for spotting any
+outliers and seeing if the data makes sense. We will use some of the
+plots in the libraries DESeq and edgeR along with some custom-made
 plots to do this.
 
 Since the range of the data is so huge, (0 - `r max(counts)`) for this
@@ -94,10 +110,9 @@ type of exploratory data analysis it is usually useful to work on
 transformed versions of the data, otherwise a relatively small change
 in a gene highly expessed will dwarf everything else.
 
-A first sanity check is to see which genes are soaking up so many
-reads.  Millions of reads for a single gene is a concerning amount
-of reads to be mapping
-to one gene.
+A first sanity check is to see which genes are soaking up so many reads.
+Millions of reads for a single gene is a concerning amount of reads to be
+mapping to one gene.
 
 ```{r high-count-genes, results='asis'}
 library(xtable)
@@ -169,11 +184,12 @@ very low counts is enormous:
 design = model.matrix(~ 0 + patient + status, data=samples)
 y = DGEList(counts = counts)
 y = calcNormFactors(y)
-y = estimateGLMCommonDisp(y, design)
+y = estimateGLMCommonDisp(y, design, verbose=TRUE)
 y = estimateGLMTrendedDisp(y, design)
 y = estimateGLMTagwiseDisp(y, design)
 bcv(y)
 ```
+
 
 So when we are looking at differentially expressed genes later on,
 focusing on genes with not an extremely low count is prudent.
@@ -196,9 +212,7 @@ meanSdPlot(assay(rld[notAllZero,]))
 
 The effect of the variance stablizing transformation on visualization of
 the data can be seen by looking at clustering of the samples based on
-Euclidean distance. Without stabilizing the variance a few highly expressed
-variant genes skew the distance measure and make clustering fail. This
-heatmap would give anyone a heart attack:
+Euclidean distance. This is the non-transformed data:
 
 ```{r heatmap-novst}
 dists = dist(t(counts))
@@ -208,7 +222,7 @@ library(gplots)
 heatmap.2(mat, trace="none")
 ```
 
-But with the variance stabilized data, we can see clear clustering on the
+with the variance stabilized data, we can see clear clustering on the
 baseline and exacerbation status of the samples:
     
 ```{r heatmap-vst}
@@ -216,6 +230,9 @@ dists = dist(t(assay(rld)))
 mat = as.matrix(dists)
 
 library(gplots)
+heatmap.2(mat, trace="none")
+
+rownames(mat) = samples$virus_status
 heatmap.2(mat, trace="none")
 ```
 
@@ -225,11 +242,7 @@ the raw data they look like this:
 mds(counts, samples$status)
 ```
 
-But using the variance transforming stabilization we can see the clear
-separation between the exacerbated and baseline samples along the
-first principal component, exactly what we were hoping to see. The
-plot on the left shows the proportion of the variance explained by
-each principal component:
+But using the variance transforming stabilization we can see the clear separation between the exacerbated and baseline samples along the first principal component. The plot on the left shows the proportion of the variance explained by each principal component:
 
 ```{r mds-transformed}
 par(mfrow=c(1,2))
@@ -242,7 +255,7 @@ From the exploratory analysis we are expecting to see quite a few genes
 that are different between the baseline and exacerbated experimental
 conditions. It is useful to start with a simple model and gradually add
 complexity to the model, so to start we will fit a model that fits
-**patient** and **status**, blocking on patient.
+**patient** and **status**, blocking on **patient**.
 
 First things first, we want to remove those low count high variance genes
 from consideration. Removing these genes chops off the hugely variant
@@ -256,7 +269,7 @@ table(keep)
 design = model.matrix(~ patient + status, data=samples)
 y = DGEList(counts = counts)
 y = calcNormFactors(y)
-y = estimateGLMCommonDisp(y, design)
+y = estimateGLMCommonDisp(y, design, verbose=TRUE)
 y = estimateGLMTrendedDisp(y, design)
 y = estimateGLMTagwiseDisp(y, design)
 bcv(y)
@@ -280,7 +293,7 @@ bcv(y)
 fit = glmFit(y, design)
 ```
 
-Now we can test for differential expression at the patient level:
+Now we can test for any differential expression at the patient level:
 
 ```{r patient-de, results='asis'}
 lrt = glmLRT(fit, coef=1:14)
@@ -307,30 +320,19 @@ de$Row.names = NULL
 ```
 
 gives us `r sum(FDR < 0.05)` genes differentially expressed.
-That is a lot of genes, cutting down that list will be helpful. As
-a hacky way of doing that, lets restrict to genes which have a
-fairly robust level of expression and also have a fold change > 4:
-
-```{r de-subset}
-de_subset = subset(de, abs(logFC) > 2 & logCPM > 1)
-```
-That leaves us with a more manageable `r dim(de_subset)[1]` genes to look at.
-
-Saving these two lists as TSV files:
-
-```{r write-tables}
-write.table(de, "de_full.tsv", quote=FALSE, row.names=FALSE, sep="\t")
-write.table(de_subset, "de_subset.tsv", quote=FALSE, row.names=FALSE,
-   sep="\t")
-```
-
+From the whole blood cell counts we were expecting
+large changes in cell type composition in the blood, so seeing this many
+differentially expressed genes was expected. 
 
 # Incorporating rhinovirus and other co-variates
-If we want to incorporate the rhinovirus status and other co-variants into the analysis, then we'll
-have to move away from using edgeR-- there are some things that none
+If we want to incorporate the rhinovirus status and other co-variants
+into the analysis, then I think we have to 
+move away from using edgeR-- there are some things that none
 of the RNA-seq specific differential expression callers can do, and
 one of those things is to handle more complicated multi-level
-experiments.  Fortunately, we can use limma to do that.
+experiments. Fortunately, we can use limma to do that. Here we create
+a very simple model where the expression depends on the rhinovirus
+status of the patient as well as the baseline/exacerbation status:
 
 ```{r limma-setup}
 library(limma)
@@ -348,27 +350,46 @@ within the same patient as `r corfit$consensus`. This is low but given the
 large changes in gene expression from the **exacerbated** and **baseline**
 statuses, this makes sense.
 
-Now we can input that correlation into the linear model fit:
+Now we can input that correlation into the linear model fit and look at
+three comparisons:
+
+1. **rhinovirus:** by comparing the rhinovirus positive exacerbated samples
+   to the rhinovirus negative exacerbated samples
+2. **exacerbation:** by comparing the rhinovirus negative exacerbated samples
+   to the baseline samples
+3. **rhinovirus_exacerbation:** by comparing the rhinovirus positive exacerbated
+   samples to the baseline samples
     
-```{r exacerbated-analysis}
+    
+```{r virus-exacerbated-analysis}
 fit = lmFit(v, design, block=samples$patient, correlation=corfit$consensus)
 cm = makeContrasts(
-    RVPositive_vs_RVNegativeForExacerbated = positive_exacerbation - negative_exacerbation, levels=design)
+        rhinovirus = positive_exacerbation - negative_exacerbation,
+        exacerbation = negative_exacerbation - negative_baseline,
+        rhinovirus_exacerbation = positive_exacerbation - negative_baseline,
+    levels=design)
 fit2 = contrasts.fit(fit, cm)
 fit2 = eBayes(fit2)
-topTable(fit2, coef="RVPositive_vs_RVNegativeForExacerbated")
 ```
 
-There are `dim(topTable(fit2, n=200,p.value=0.05, coef="RVPositive_vs_RVNegativeForExacerbated"))[1]` genes different between the rhinovirus positive and rhinovirus negative samples in the exacerbated state.
+##qqt(fit2$t,df=fit2$df.prior+fit2$df.residual,pch=16,cex=0.1)
+
+There are `r dim(topTable(fit2, n=Inf,p.value=0.05, coef="rhinovirus"))[1]` genes different in the **rhinovirus** comparison, `r dim(topTable(fit2, n=Inf,p.value=0.05, coef="exacerbation"))[1]` genes differentially in the **exacerbation** only condition
+and 
+`r dim(topTable(fit2, n=Inf,p.value=0.05, coef="rhinovirus_exacerbation"))[1]` genes differentially expressed in the **rhinovirus_exacerbation** condition. Again,
+there are large changes in cell types between the exacerbated and baseline
+conditions that will need to be corrected for.
 
 ## Simple differential expression wrapup 
 The gene sets different in the baseline/exacerbated status are large
 because it is likely there are different populations of cells in the
-blood at the exacerbated and baseline timepoints.  We can do a quick
-check if that is true by clustering a subset of the sample table on
-those measurements, similar to Figure 1 of the That is it for a first
-pass differential expression analysis. First we need to massage the
-sample table to only keep numerical values:
+blood at the exacerbated and baseline timepoints. Luckily we have some
+measurements of the cell types in the blood and we can do a quick
+check if the measured cell types in the blood can predict anything about
+the **exaceration/baseline** status of the samples. The first way to
+visualize that is to cluster subset of the sample table on
+those measurements. First we need to massage the
+sample table to only keep numerical values and make a heatmap:
 
 ```{r sample-clustering}
 heatmap_samples = samples[, numeric_columns]
@@ -416,11 +437,8 @@ logit = glm(form, data=samples, family="binomial")
 summary(logit)
 ```
 
-Those warnings are a red flag. We can see the residual deviance is extremely small,
-that generally happens when one of the predictors in the model can classify the
-samples perfectly. If that is true we can see which predictor has that
-feature by making a decision tree using the same model we used for the
-logistical regression:
+The residual deviance is extremely small,
+that generally happens when one of the predictors in the model can classify the samples perfectly. If that is true we can see which predictor has that feature by making a decision tree using the same model we used for the logistical regression:
 
 ```{r decision-tree}
 library(rpart)
@@ -428,7 +446,7 @@ rpart(form, data=samples)
 ```
 
 We can see that splitting the samples on standardized $ALC >= 1.935$
-perfectly classifies the samples into **exacerbated** and **baseline** status.
+partitions the samples into **exacerbated** and **baseline** status.
 
 For now we will drop that from the model to see what other factors might
 be involved:
@@ -453,45 +471,131 @@ logit = glm(form, data=samples, family="binomial")
 summary(logit)
 ```
 
-So a set of factors that are expected to have an effect on gene
-expression status are $rhinovirus + WBC + AEC + ANC + ALC$.
+So, just based on the metadata provided,  a set of factors that we expect to
+have an effect on gene expression in the exacerbated/baseline stamples are
+$$rhinovirus + WBC + AEC + ANC + ALC$$. 
 
-# Cell-type corrected differential expression
-The first thing we need to do is to place the regressors on some kind
-of similar scale. Converting the values to Z-scores is one way to do that.
+# Naive cell-type corrected differential expression 
+For the first shot, we will use all of the standardized whole blood measurements as
+regressors in the model, ignoring what we did above to pick out the most
+important ones:
 
-`{r corrected-de}
-samples_norm$virus_status = factor(paste(samples_norm$rhinovirus,
-    samples_norm$status, sep="_"))
-#design = model.matrix(~ 0 + virus_status, data=samples)
-design = model.matrix(~ 0 + Hct_pct + Hgb + Plt + AEC + status, 
+```{r naive-de}
+design = model.matrix(~ 0 + WBC + Hct_pct + Hgb +
+    Plt + AEC + ANC + ALC + Neut_pct + Baso_pct + virus_status, data=samples_norm)
+colnames(design) = c("WBC", "Hct_pct", "Hgb", "Plt", "AEC", "ANC", "ALC",
+    "Neut_pct", "Baso_pct", "negative_baseline", "negative_exacerbation",
+    "positive_exacerbation")
+```
+
+And look at the same comparisons as we did before without correcting for
+the whole blood measurements:
+    
+1. **rhinovirus:** by comparing the rhinovirus positive exacerbated samples
+   to the rhinovirus negative exacerbated samples
+2. **exacerbation:** by comparing the rhinovirus negative exacerbated samples
+   to the baseline samples
+3. **rhinovirus_exacerbation:** by comparing the rhinovirus positive exacerbated
+   samples to the baseline samples
+
+```{r naive-analysis}
+cm = makeContrasts(
+        rhinovirus = positive_exacerbation - negative_exacerbation,
+        exacerbation = negative_exacerbation - negative_baseline,
+        rhinovirus_exacerbation = positive_exacerbation - negative_baseline,
+    levels=design)
+y = DGEList(counts=counts)
+y = calcNormFactors(y)
+v = voom(y, design)
+corfit = duplicateCorrelation(v, design, block=samples$patient)
+fit = lmFit(v, design, block=samples$patient, correlation=corfit$consensus)
+fit2 = contrasts.fit(fit, cm)
+fit2 = eBayes(fit2)
+```
+There are `r dim(topTable(fit2, coef="exacerbation", n=Inf,p.value=0.05))[1]`
+genes different in the **exacerbation** comparison, 
+`r dim(topTable(fit2, coef="rhinovirus", n=Inf,p.value=0.05))[1]`
+genes different in the **rhinovirus** comparison and
+`r  dim(topTable(fit2, coef="rhinovirus_exacerbation", n=Inf,p.value=0.05))[1]`
+genes different in the 
+the exacerbated samples alone. 
+
+What if we focus on just the 
+non-rhinovirus positive samples?
+
+```{r no-rhinovirus-analysis}
+design = model.matrix(~ 0 + WBC + Hct_pct + Hgb +
+    Plt + AEC + ANC + ALC + Neut_pct + Baso_pct + virus_status,
     data=samples_norm)
 y = DGEList(counts=counts)
 y = calcNormFactors(y)
 v = voom(y, design, plot=TRUE)
-corfit = duplicateCorrelation(v, design, block=samples_norm$patient)
-```
-
-From the correlation fit we can estimate the correlation on
-comparisons made within the same patient as `r corfit$consensus`. The
-effect of controlling for the This is low but given the large changes
-in gene expression from the **exacerbated** and **baseline** statuses,
-this makes sense.
-
-Now we can input that correlation into the linear model fit:
-    
-```{r exacerbated-analysis}
-fit = lmFit(v, design, block=samples_norm$patient, correlation=corfit$consensus)
+corfit = duplicateCorrelation(v, design, block=samples$patient)
 cm = makeContrasts(
-    RVPositive_vs_RVNegativeForExacerbated = virus_statuspositive_exacerbation - virus_statusnegative_exacerbation, levels=design)
+    rhinovirus=virus_statuspositive_exacerbation-virus_statusnegative_exacerbation,
+    exacerbation=virus_statusnegative_exacerbation-virus_statusnegative_baseline,
+    rhinovirus_asthma=virus_statuspositive_exacerbation-virus_statusnegative_baseline,
+    levels=design)
+fit = lmFit(v, design, block=samples$patient, correlation=corfit$consensus)
 fit2 = contrasts.fit(fit, cm)
 fit2 = eBayes(fit2)
-dim(topTable(fit2, coef="RVPositive_vs_RVNegativeForExacerbated", p.value=0.05,n=Inf))
-FDR = p.adjust(fit2$table$PValue, method="BH")
+```
 
-# below here is a check to just do this all in edgeR
-design = model.matrix(~ 0 + patient + rhinovirus + WBC + Hct_pct + Hgb + Plt + AEC +
-  + Neut_pct + Baso_pct + status, data=samples_norm)
+
+We've wiped out most of our signal by trying to simultaneously control for
+so many factors. If we just include the regressors that we deemed to be
+important, there are a couple more hits:
+
+```{r controlled-de}
+design = model.matrix(~ 0 + rhinovirus + WBC + AEC + ANC + ALC +
+    status, data=samples_norm)
+cm = makeContrasts(
+    rhinovirus=rhinoviruspositive-statusexacerbation,
+    exacerbation=statusexacerbation,
+    levels=design)
+y = DGEList(counts=counts)
+y = calcNormFactors(y)
+v = voom(y, design, plot=TRUE)
+corfit = duplicateCorrelation(v, design, block=samples$patient)
+fit = lmFit(v, design, block=samples$patient, correlation=corfit$consensus)
+fit2 = contrasts.fit(fit, cm)
+fit2 = eBayes(fit2)
+```
+
+There are `r dim(topTable(fit2, coef="exacerbation", n=Inf,p.value=0.05))[1]`
+genes different between the samples in the baseline and exacerbated state.
+
+There are  `r dim(topTable(fit2, coef="rhinovirus", n=Inf,p.value=0.05))[1]`
+genes different in the rhinovirus comparison.
+
+
+The model seems to capture a lot of the main features of the data,
+even if we only include a subset of the factors.  Surrogate Variable
+Analysis (SVA) removes systematic differences in data by performing
+SVD on the residuals of a model fit and determining if the identified
+eigensystems are due to chance via permutation.
+
+`{r sva}
+library(sva)
+n.sv = num.sv(v$E, design, method="leek")
+```
+
+SVA detects `r n.sv` systematic unmodeled variables that need to be adjusted
+for in the data so it seems like we are capturing the major effects.
+
+
+# Revisiting edgeR
+EdgeR models the count data as negative binomial distributed instead of
+first transforming the data to continuous pseudo-expression values.
+We saw above that logging the data did not completely smooth out the
+mean-variance relationship in the data, so it is possible we are losing some
+power to detect differentially regulated genes using limma. Using edgeR
+fixes that problem but we lose some of the ability to handle things like
+multi-level models.
+
+```{r edger-revisited}
+design = model.matrix(~ 0 + patient + rhinovirus + WBC + Hct_pct + Hgb + Plt +
+    AEC +  Neut_pct + Baso_pct + status, data=samples_norm)
 rownames(design) = colnames(counts)
 y = DGEList(counts=counts)
 y = calcNormFactors(y)
@@ -500,7 +604,7 @@ y = estimateGLMTrendedDisp(y, design)
 y = estimateGLMTagwiseDisp(y, design)
 bcv(y)
 fit = glmFit(y, design)
-lrt = glmLRT(fit, coef=22)
+lrt = glmLRT(fit, coef=23)
 FDR = p.adjust(lrt$table$PValue, method="BH")
 de = lrt$table
 de$FDR = FDR
@@ -509,29 +613,7 @@ de = annotate_df(de)
 de = de[with(de, order(FDR)),]
 de$id = de$Row.names
 de$Row.names = NULL
+print(xtable(de), "html")
+```
 
-expected = c("CDHR3", "PDE4D", "DENND1B", "RAD50", "IL13",
- "IL1RL1", "IL2RL1", "IL3RL1", "IL4RL1", "IL5RL1", "IL6RL1",
- "IL7RL1", "IL8RL1", "IL9RL1", "IL10RL1", "IL11RL1", "IL12RL1",
- "IL13RL1", "IL14RL1", "IL15RL1", "IL16RL1", "IL17RL1",
- "IL18RL1", "IL33", "RORA", "SMAD3", "IL2RB", "TSLP-WDR36",
- "PYHIN1", "ADRA1B", "DPP10", "PRNP")
-
-We recover 'r sum(expected %in% de$hgnc_symbol)' of those expected genes.
-
-Some of the hits show up though:
-
-AREG: http://www.ncbi.nlm.nih.gov/pubmed/21036386
-
- 
-IL1RL1-IL18R1 (Moffatt et al. 2010; Torgerson et al. 2011)
-GSDMB/ORMDL3 (Moffatt et al. 2010; Torgerson et al. 2011)
-IL33 (Moffatt et al. 2010; Torgerson et al. 2011)
-RORA (Moffatt et al. 2010)
-SMAD3 (Moffatt et al. 2010)
-IL2RB (Moffatt et al. 2010)
-TSLP-WDR36) (Hirota et al. 2011; Torgerson et al. 2011)
-PYHIN1 (Torgerson et al. 2011)
-ADRA1B (Mathias et al. 2010)
-DPP10 (Mathias et al. 2010)
-PRNP (Mathias et al. 2010)
+None of these genes are in the expected set either though.
