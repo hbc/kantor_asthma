@@ -557,7 +557,7 @@ Analysis (SVA) removes systematic differences in data by performing
 SVD on the residuals of a model fit and determining if the identified
 eigensystems are due to chance via permutation.
 
-`{r sva}
+```{r sva}
 library(sva)
 n.sv = num.sv(v$E, design, method="leek")
 ```
