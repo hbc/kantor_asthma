@@ -520,38 +520,20 @@ genes different in the **rhinovirus** comparison and
 genes different in the 
 the exacerbated samples alone. 
 
-What if we focus on just the 
-non-rhinovirus positive samples?
-
-```{r no-rhinovirus-analysis}
-design = model.matrix(~ 0 + WBC + Hct_pct + Hgb +
-    Plt + AEC + ANC + ALC + Neut_pct + Baso_pct + virus_status,
-    data=samples_norm)
-y = DGEList(counts=counts)
-y = calcNormFactors(y)
-v = voom(y, design, plot=TRUE)
-corfit = duplicateCorrelation(v, design, block=samples$patient)
-cm = makeContrasts(
-    rhinovirus=virus_statuspositive_exacerbation-virus_statusnegative_exacerbation,
-    exacerbation=virus_statusnegative_exacerbation-virus_statusnegative_baseline,
-    rhinovirus_asthma=virus_statuspositive_exacerbation-virus_statusnegative_baseline,
-    levels=design)
-fit = lmFit(v, design, block=samples$patient, correlation=corfit$consensus)
-fit2 = contrasts.fit(fit, cm)
-fit2 = eBayes(fit2)
-```
-
-
 We've wiped out most of our signal by trying to simultaneously control for
 so many factors. If we just include the regressors that we deemed to be
 important, there are a couple more hits:
 
 ```{r controlled-de}
-design = model.matrix(~ 0 + rhinovirus + WBC + AEC + ANC + ALC +
-    status, data=samples_norm)
+design = model.matrix(~ 0 + WBC + AEC + ANC + ALC +
+    virus_status, data=samples_norm)
+colnames(design) = c("WBC", "AEC", "ANC", "ALC",
+    "negative_baseline", "negative_exacerbation",
+    "positive_exacerbation")
 cm = makeContrasts(
-    rhinovirus=rhinoviruspositive-statusexacerbation,
-    exacerbation=statusexacerbation,
+        rhinovirus = positive_exacerbation - negative_exacerbation,
+        exacerbation = negative_exacerbation - negative_baseline,
+        rhinovirus_exacerbation = positive_exacerbation - negative_baseline,
     levels=design)
 y = DGEList(counts=counts)
 y = calcNormFactors(y)
@@ -593,7 +575,7 @@ power to detect differentially regulated genes using limma. Using edgeR
 fixes that problem but we lose some of the ability to handle things like
 multi-level models.
 
-```{r edger-revisited}
+```{r edger-revisited, results='asis'}
 design = model.matrix(~ 0 + patient + rhinovirus + WBC + Hct_pct + Hgb + Plt +
     AEC +  Neut_pct + Baso_pct + status, data=samples_norm)
 rownames(design) = colnames(counts)
