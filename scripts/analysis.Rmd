@@ -281,56 +281,59 @@ expression analysis. It is interesting to ask whether or not it is even
 necessary to do that. All of our analysis is going to use a model where
 we fit a GLM blocking on patient, so first do that:
 
-```{r edgeR-fit}
-design = model.matrix(~ 0 + patient + status, data=samples)
-rownames(design) = colnames(counts)
-y = DGEList(counts=counts)
+```{r basic-patient-comparison}
+design = model.matrix(~ 0 + patient,
+    data=samples)
+y = DGEList(counts = counts)
 y = calcNormFactors(y)
-y = estimateGLMCommonDisp(y, design, verbose=TRUE)
-y = estimateGLMTrendedDisp(y, design)
-y = estimateGLMTagwiseDisp(y, design)
-bcv(y)
-fit = glmFit(y, design)
+cm = makeContrasts(
+    onepatient=patientA010-patientA004,
+    levels=design)
+v = voom(y, design, plot=TRUE)
+fit = lmFit(v, design)
+fit2 = contrasts.fit(fit, cm)
+fit2 = eBayes(fit2)
 ```
 
-Now we can test for any differential expression at the patient level:
+And look at a single difference between two random patients, **patientA010** and
+**patientA004**. There are `r  dim(topTable(fit2, n=Inf, p.value=0.05))[1]`
+genes different in this comparison, even without correcting for the exacerbation
+status. So we will need to correct for intra-patient differences when doing
+these comparisons.
 
-```{r patient-de, results='asis'}
-lrt = glmLRT(fit, coef=1:14)
-FDR = p.adjust(lrt$table$PValue, method="BH")
-print(xtable(topTags(lrt)$table), "html")
+This doesn't mean that those are the only genes that are different, there are
+quite a few differences between **patientA010** and **patientA004**:
+
+```{r status-de-logfc}
+volcanoplot(fit2)
 ```
 
-There are `r sum(FDR < 0.05)` genes differentially expressed between
-patients, so blocking on patient is a good plan.
+But not correcting for the exacerbation status of the patient means the
+estimated variance between the patients is large, since the
+**exacerbation** and **baseline** measurements for each patient are combined.
+For example there are `r  sum(abs(topTable(fit2, n=Inf, p.value=1)$logFC) > 2)`
+genes with a logFC > 2 between these two patients.
 
-Going ahead and doing a differential expression test on the exacerbation
-status, blocking on patient:
+Going ahead and fitting a model including the exacerbation status, blocking
+on patient:
 
 ```{r status-de}
-lrt = glmLRT(fit, coef=15)
-FDR = p.adjust(lrt$table$PValue, method="BH")
-de = lrt$table
-de$FDR = FDR
-de = subset(de, FDR < 0.05)
-de = annotate_df(de)
-de = de[with(de, order(FDR)),]
-de$id = de$Row.names
-de$Row.names = NULL
+design = model.matrix(~ 0 + patient + status,
+    data=samples)
+y = DGEList(counts = counts)
+y = calcNormFactors(y)
+v = voom(y, design, plot=TRUE)
+fit = lmFit(v, design)
+fit2 = contrasts.fit(fit, coef=15)
+fit2 = eBayes(fit2)
 ```
 
-gives us `r sum(FDR < 0.05)` genes differentially expressed.
-From the whole blood cell counts we were expecting
-large changes in cell type composition in the blood, so seeing this many
-differentially expressed genes was expected. 
+There are  `r  dim(topTable(fit2, n=Inf, p.value=0.05))[1]` genes differentially
+expressed if we look at just the exacerbation status and block on patient.
+
 
 # Incorporating rhinovirus and other co-variates
-If we want to incorporate the rhinovirus status and other co-variants
-into the analysis, then I think we have to 
-move away from using edgeR-- there are some things that none
-of the RNA-seq specific differential expression callers can do, and
-one of those things is to handle more complicated multi-level
-experiments. Fortunately, we can use limma to do that. Here we create
+First create 
 a very simple model where the expression depends on the rhinovirus
 status of the patient as well as the baseline/exacerbation status:
 
@@ -370,15 +373,24 @@ cm = makeContrasts(
     levels=design)
 fit2 = contrasts.fit(fit, cm)
 fit2 = eBayes(fit2)
+rhinovirus_only = fit2
 ```
-
-##qqt(fit2$t,df=fit2$df.prior+fit2$df.residual,pch=16,cex=0.1)
 
 There are `r dim(topTable(fit2, n=Inf,p.value=0.05, coef="rhinovirus"))[1]` genes different in the **rhinovirus** comparison, `r dim(topTable(fit2, n=Inf,p.value=0.05, coef="exacerbation"))[1]` genes differentially in the **exacerbation** only condition
 and 
 `r dim(topTable(fit2, n=Inf,p.value=0.05, coef="rhinovirus_exacerbation"))[1]` genes differentially expressed in the **rhinovirus_exacerbation** condition. Again,
 there are large changes in cell types between the exacerbated and baseline
 conditions that will need to be corrected for.
+
+### Examining the fit
+We can see by looking at the average expresssion value of the gene and the
+residuals that we have corrected for the mean-variance relationship we
+saw in the data:
+
+```{r mean-variance-corrected}
+ggplot(data.frame(fit), aes(Amean, sigma)) + geom_point() +
+    xlab("Mean expression") + ylab("Residual standard deviation")
+```
 
 ## Simple differential expression wrapup 
 The gene sets different in the baseline/exacerbated status are large
@@ -511,6 +523,7 @@ corfit = duplicateCorrelation(v, design, block=samples$patient)
 fit = lmFit(v, design, block=samples$patient, correlation=corfit$consensus)
 fit2 = contrasts.fit(fit, cm)
 fit2 = eBayes(fit2)
+naive_fit = fit2
 ```
 There are `r dim(topTable(fit2, coef="exacerbation", n=Inf,p.value=0.05))[1]`
 genes different in the **exacerbation** comparison, 
@@ -542,6 +555,7 @@ corfit = duplicateCorrelation(v, design, block=samples$patient)
 fit = lmFit(v, design, block=samples$patient, correlation=corfit$consensus)
 fit2 = contrasts.fit(fit, cm)
 fit2 = eBayes(fit2)
+controlled_fit = fit2
 ```
 
 There are `r dim(topTable(fit2, coef="exacerbation", n=Inf,p.value=0.05))[1]`
@@ -550,6 +564,20 @@ genes different between the samples in the baseline and exacerbated state.
 There are  `r dim(topTable(fit2, coef="rhinovirus", n=Inf,p.value=0.05))[1]`
 genes different in the rhinovirus comparison.
 
+There are  `r dim(topTable(fit2, coef="rhinovirus_exacerbation", n=Inf, p.value=0.05))[1]` genes different in the rhinovirus comparison.
+
+Writing these out to a file:
+```{r write-values}
+write.table(data.frame(topTable(fit2, coef="exacerbation",
+   n=Inf, p.value=1)), file="exacerbation.tsv", quote=FALSE, row.names=TRUE,
+   col.names=TRUE, sep="\t")
+write.table(data.frame(topTable(fit2, coef="rhinovirus",
+   n=Inf, p.value=1)), file="rhinovirus.tsv", quote=FALSE, row.names=TRUE,
+   col.names=TRUE, sep="\t")
+write.table(data.frame(topTable(fit2, coef="rhinovirus_exacerbation",
+   n=Inf, p.value=1)), file="rhinovirus_exacerbation.tsv", quote=FALSE,
+   row.names=TRUE, col.names=TRUE, sep="\t")
+```
 
 The model seems to capture a lot of the main features of the data,
 even if we only include a subset of the factors.  Surrogate Variable
@@ -565,37 +593,82 @@ n.sv = num.sv(v$E, design, method="leek")
 SVA detects `r n.sv` systematic unmodeled variables that need to be adjusted
 for in the data so it seems like we are capturing the major effects.
 
-
-# Revisiting edgeR
-EdgeR models the count data as negative binomial distributed instead of
-first transforming the data to continuous pseudo-expression values.
-We saw above that logging the data did not completely smooth out the
-mean-variance relationship in the data, so it is possible we are losing some
-power to detect differentially regulated genes using limma. Using edgeR
-fixes that problem but we lose some of the ability to handle things like
-multi-level models.
-
-```{r edger-revisited, results='asis'}
-design = model.matrix(~ 0 + patient + rhinovirus + WBC + Hct_pct + Hgb + Plt +
-    AEC +  Neut_pct + Baso_pct + status, data=samples_norm)
-rownames(design) = colnames(counts)
+# Post meeting notes
+We talked about controlling for just one of the blood cell counts to
+make sure the model is working correctly. Here are the results if you
+just include **ALC** in the model, one of the perfect predictors of
+exacerbation status
+    
+```{r controlled-de-ALC}
+design = model.matrix(~ 0 +  ALC + virus_status, data=samples_norm)
+colnames(design) = c("ALC", "negative_baseline", "negative_exacerbation",
+    "positive_exacerbation")
+cm = makeContrasts(
+        rhinovirus = positive_exacerbation - negative_exacerbation,
+        exacerbation = negative_exacerbation - negative_baseline,
+        rhinovirus_exacerbation = positive_exacerbation - negative_baseline,
+    levels=design)
 y = DGEList(counts=counts)
 y = calcNormFactors(y)
-y = estimateGLMCommonDisp(y, design, verbose=TRUE)
-y = estimateGLMTrendedDisp(y, design)
-y = estimateGLMTagwiseDisp(y, design)
-bcv(y)
-fit = glmFit(y, design)
-lrt = glmLRT(fit, coef=23)
-FDR = p.adjust(lrt$table$PValue, method="BH")
-de = lrt$table
-de$FDR = FDR
-de = subset(de, FDR < 0.05)
-de = annotate_df(de)
-de = de[with(de, order(FDR)),]
-de$id = de$Row.names
-de$Row.names = NULL
-print(xtable(de), "html")
+v = voom(y, design, plot=TRUE)
+corfit = duplicateCorrelation(v, design, block=samples$patient)
+fit = lmFit(v, design, block=samples$patient, correlation=corfit$consensus)
+fit2 = contrasts.fit(fit, cm)
+fit2 = eBayes(fit2)
 ```
 
-None of these genes are in the expected set either though.
+There are `r dim(topTable(fit2, coef="exacerbation", n=Inf,p.value=0.05))[1]`
+genes different between the samples in the baseline and exacerbated state.
+
+There are  `r dim(topTable(fit2, coef="rhinovirus", n=Inf,p.value=0.05))[1]`
+genes different in the rhinovirus comparison.
+
+There are  `r dim(topTable(fit2, coef="rhinovirus_exacerbation", n=Inf, p.value=0.05))[1]` genes different in the rhinovirus comparison.
+
+# Are the rhinovirus genes the same for the different comparisons?
+Another great question that came up was are the **rhinovirus** genes similar
+across the differently modeled results:
+    
+```{r rhinovirus-repeats}
+library(Vennerable)
+rhinovirus = topTable(rhinovirus_only, n=Inf, p.value=0.05, coef="rhinovirus")
+naive = topTable(naive_fit, n=Inf, p.value=0.05, coef="rhinovirus")
+controlled = topTable(controlled_fit, n=Inf, p.value=0.05, coef="rhinovirus")
+#rhinovirus_only, naive_fit, controlled_fit
+x = list(rhinovirus=rownames(rhinovirus),
+         naive=rownames(naive),
+         controlled=rownames(controlled))
+x = Venn(x)
+plot(x)
+```
+
+# Are any from the expected set present?
+Unfortunately, no.
+```{r expected-present}
+x = intersect(rownames(rhinovirus), intersect(rownames(controlled), rownames(naive)))
+table(expected %in% x)
+```
+
+# If we correct and compare across patients, do differences remain?
+Another question was if you do the blood cell type correction and compare
+across patients, do minor differences remain? It looks like minor differences do.
+As an example, what is different between patient
+**patientA010** and **patientA004**, after correcting for cell types
+in the blood and correcting for **exacerbation** and **baseline**
+status:
+    
+```{r patient-corrected-comparison}
+design = model.matrix(~ 0 + patient + WBC + AEC + ANC + ALC + status,
+    data=samples_norm)
+y = DGEList(counts = counts)
+y = calcNormFactors(y)
+cm = makeContrasts(
+    onepatient=patientA010-patientA004,
+    levels=design)
+v = voom(y, design, plot=TRUE)
+fit = lmFit(v, design)
+fit2 = contrasts.fit(fit, cm)
+fit2 = eBayes(fit2)
+```
+There are `r  dim(topTable(fit2, n=Inf, p.value=0.05))[1]`
+genes differentially expressed between patientA010 and patientA004.
